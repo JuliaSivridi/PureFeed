@@ -586,10 +586,11 @@ class TelegramBot:
                         },
                     )
                     data = resp.json()
-                    if data.get("ok"):
-                        logger.info(f"Relay: права администратора назначены (user={self._userbot_id})")
+                    desc = data.get("description", "")
+                    if data.get("ok") or "owner" in desc.lower():
+                        pass  # Успех или уже владелец — всё хорошо
                     else:
-                        logger.warning(f"Relay: не удалось назначить права: {data.get('description')}")
+                        logger.warning(f"Relay: не удалось назначить права: {desc}")
 
             logger.info(f"Relay готов: канал {self._relay_chat_id} «{getattr(full, 'title', '?')}»")
         except Exception as e:
