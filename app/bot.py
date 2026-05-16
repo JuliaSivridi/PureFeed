@@ -78,6 +78,10 @@ class TelegramBot:
         self._media_groups: dict[int, dict] = {}
         self._media_group_tasks: dict[int, asyncio.Task] = {}
 
+        # Счётчики для диагностики
+        self._events_total: int = 0   # всего событий NewMessage
+        self._events_matched: int = 0  # из них попавших в фид
+
     def _create_client(self) -> TelegramClient:
         return TelegramClient(
             f"{BOT_SESSION_DIR}/telegram_{self.user_id}",
@@ -222,6 +226,12 @@ class TelegramBot:
 
         await self._init_bot_relay()
 
+        # Сразу вытягиваем пропущенные обновления (на случай если бот был остановлен).
+        try:
+            await self.client.catch_up()
+        except Exception as e:
+            logger.warning(f"catch_up не удался: {e}")
+
         # Фоновый цикл: каждые 30 с синхронизируем состояние обновлений.
         # Telegram не всегда шлёт push для каналов — без этого задержка может быть 10-15 минут.
         asyncio.create_task(self._updates_keepalive())
@@ -236,6 +246,11 @@ class TelegramBot:
             self._current_handler = None
         self._monitoring = False
         self._monitored_channels = []
+        self._dialogs_loaded = False
+        self._bot_entity = None
+        self._relay_chat_id = None
+        if self.client and self.client.is_connected():
+            await self.client.disconnect()
         logger.info("Мониторинг остановлен")
 
     async def reload_feeds(self):
@@ -246,8 +261,10 @@ class TelegramBot:
         await self._setup_handler()
 
     async def _updates_keepalive(self):
-        """Каждые 30 с запрашивает GetState — заставляет Telethon подтянуть пропущенные обновления."""
+        """Каждые 30 с запрашивает GetState — заставляет Telethon подтянуть пропущенные обновления.
+        Каждые 2 минуты логирует счётчик обработанных событий для диагностики."""
         from telethon import functions
+        ticks = 0
         while self._monitoring:
             await asyncio.sleep(30)
             if not self._monitoring:
@@ -256,6 +273,15 @@ class TelegramBot:
                 await self.client(functions.updates.GetStateRequest())
             except Exception:
                 pass
+            ticks += 1
+            if ticks % 4 == 0:  # каждые 2 минуты
+                logger.info(
+                    f"[heartbeat] events за 2 мин: всего={self._events_total} "
+                    f"в фид={self._events_matched} "
+                    f"каналов={len(self._monitored_channels)}"
+                )
+                self._events_total = 0
+                self._events_matched = 0
 
     @property
     def is_monitoring(self) -> bool:
@@ -335,6 +361,7 @@ class TelegramBot:
         try:
             message: Message = event.message
             chat = await event.get_chat()
+            self._events_total += 1
 
             chat_username = None
             if hasattr(chat, 'username') and chat.username:
@@ -357,6 +384,7 @@ class TelegramBot:
                 logger.debug(f"Не в фидах: chat.id={chat.id} username={chat_username} title={getattr(chat, 'title', '?')!r}")
                 return
 
+            self._events_matched += 1
             logger.info(f"Сообщение из {chat_username or chat.id} (id={chat.id}) → {len(feeds_for_channel)} фид(ов)")
 
             # Помечаем прочитанным в исходном канале
