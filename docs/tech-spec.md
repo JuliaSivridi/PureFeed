@@ -1,6 +1,6 @@
 # PureFeed — Technical Specification
 
-**Version:** 1.0 (April 2026)  
+**Version:** 1.1 (May 2026)  
 **Repository:** github.com/JuliaSivridi/PureFeed  
 **Bot:** @pure_feed_bot  
 **Stack:** Python 3.11 · FastAPI · Telethon · SQLite · Docker
@@ -18,10 +18,11 @@ PureFeed is a self-hosted, multi-user Telegram feed filter. Each user authentica
 | **No web UI** | All management via Telegram bot inline keyboards — zero external port exposure needed |
 | **Per-user Telethon clients** | Each user monitors only their own subscribed channels; no cross-user data leakage |
 | **Relay Buffer channel** | Bot token as the forwarder generates unread counters; direct userbot forwards do not |
-| **QR-code auth only** | Telegram blocks server-IP phone+code login; QR auth happens device-side |
+| **QR-code auth only (recommended)** | Telegram blocks server-IP phone+code login; QR auth happens device-side |
 | **SQLite (not Postgres)** | Single-file, zero-config, sufficient for thousands of users given async I/O via aiosqlite |
 | **In-memory conversation state** | Bot command dialogs are ephemeral; DB stores only persistent data |
 | **FastAPI as shell** | Provides health-check endpoint and clean asyncio lifespan hooks; no REST API otherwise |
+| **editMessageText for navigation** | Editing in place avoids the message jumping to the bottom of the chat on every button press |
 
 ---
 
@@ -79,8 +80,8 @@ _forward_message() ◀───────────────────�
         │    → Bot API forwardMessage(from=relay, to=destination)             │
         │    → Telethon delete_messages(relay_channel, [relay_id])            │
         │    Result: unread counter ✅                                         │
-        │                                                                    │
-        └─── direct path (fallback if relay fails) ──────────────────────────┘
+        │                                                                     │
+        └─── direct path (fallback if relay fails) ───────────────────────────
              Telethon forward_messages(destination, msg)
              Result: no unread counter ❌
 ```
@@ -93,7 +94,7 @@ User presses button in bot
 → DB write (aiosqlite)
 → bot.reload_feeds()
 → _setup_handler(resolve_ids=True)  ← rebuilds channel→feed mapping
-→ _show(chat_id, ...)               ← delete old message, send new
+→ _show(chat_id, msg_id, ...)       ← editMessageText in place (no scroll jump)
 ```
 
 ### Read Path (monitoring)
@@ -115,13 +116,14 @@ On start_monitoring():
 - **Auth exceptions** → surface to user via bot message; bot continues for other users
 - **Polling exceptions** → log, sleep 5s, retry (bot never crashes)
 - **Keepalive exceptions** → silently swallowed; loop continues
+- **editMessageText "not modified"** → silently ignored; no fallback needed
 
 ---
 
 ## 4. Package / Folder Structure
 
 ```
-D:\Projects\Telegram_subs\
+Pure_Feed/
 ├── app/
 │   ├── __init__.py          # Package marker (empty)
 │   ├── main.py              # FastAPI app; lifespan: init_db → start_all → run_polling
@@ -196,7 +198,7 @@ Many-to-one with Feed. Stores each ad-detection rule.
 | feed_id | int | FK → feeds.id ON DELETE CASCADE |
 | keyword | str | Stored lowercase; single word or `word+word` AND-rule |
 
-### ChannelLastSeen (legacy)
+### ChannelLastSeen (legacy, unused by current handler)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -248,7 +250,7 @@ CREATE TABLE user_settings (
 );
 ```
 
-**Migration:** On startup, `init_db()` attempts `ALTER TABLE feeds ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`. The `except` block silently ignores `OperationalError` if column exists.
+**Migration:** On startup, `init_db()` attempts `ALTER TABLE feeds ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`. The `except` block silently ignores `OperationalError` if column exists. No formal version tracking.
 
 **Bulk read pattern:** `get_all_feeds()` fetches feeds, then channels, then keywords in **three queries** (not N+1) using `WHERE feed_id IN (?,?,...)`.
 
@@ -281,15 +283,15 @@ CREATE TABLE user_settings (
 6. Bot: calls bot.start_qr_auth()
      → _ensure_client() lazy-inits TelegramClient
      → client.qr_login() → QRLogin object with .url (tg://login?token=...)
-     → generate QR PNG via qrcode library
-     → sendPhoto to user with caption + /esc hint
+     → URL encoded via urllib.parse.quote(url, safe='')
+     → sendPhoto with QR image from api.qrserver.com/v1/create-qr-code/?size=300x300
 7. Bot: creates background task _qr_auth_waiter(chat_id, bot, sm)
 8. Bot: sets state auth_qr_wait (stores task ref for cancellation)
 9. User: opens Telegram → Settings → Devices → Scan QR code
 10. Telegram: approves session server-side (user's device talks to Telegram)
 11. _qr_auth_waiter: await qr.wait(timeout=120s)
     → SUCCESS: clear state, call bot.start_monitoring(), show feed list
-    → TIMEOUT: notify user "QR-код истёк"
+    → TIMEOUT: notify user "QR-код истёк. Попробуйте снова — /settings → Войти через QR."
     → SessionPasswordNeededError: transition to auth_2fa_qr state
 12. [If 2FA] User types password → bot.confirm_2fa(password) → start_monitoring()
 ```
@@ -307,8 +309,9 @@ CREATE TABLE user_settings (
 10. User: enters 5-digit code
 11. Bot: await bot.confirm_auth(phone, code, hash)
     → SUCCESS: start_monitoring()
-    → SessionPasswordNeededError: prompt 2FA
-    → PhoneCodeInvalidError / PhoneCodeExpiredError: show error
+    → SessionPasswordNeededError: prompt 2FA password
+    → PhoneCodeInvalidError: "Неверный код подтверждения"
+    → PhoneCodeExpiredError: "Код подтверждения истёк. Запросите новый"
 12. [If 2FA] Same as QR flow step 12
 ```
 
@@ -325,7 +328,7 @@ Called in `start_monitoring()` and on `reload_feeds()`:
 ```
 Phase 1 – resolve_ids=False (called immediately on start):
   - Read enabled feeds from DB (get_all_feeds(user_id=self.user_id))
-  - Build channel_to_feeds: dict[str, list[feed]]  (@username → feeds)
+  - Build channel_to_feeds: dict[str, list[feed]]  (channel_key → feeds)
   - Skip @username → ID resolution (entity cache empty)
   - Remove previous NewMessage handler if exists
   - Register new handler with: channel_to_feeds, id_to_feeds={}
@@ -336,10 +339,12 @@ Phase 1 – resolve_ids=False (called immediately on start):
 
 Phase 2 – resolve_ids=True (called after dialogs loaded):
   - Same feed read + channel_to_feeds build
-  - For each channel key:
-      try: entity = await client.get_input_entity(key)
-           id_to_feeds[entity.channel_id] = feeds_list
-      except Exception: log warning, continue
+  - For numeric keys starting with -100: parse directly, no network call
+  - For @username keys not in _channel_id_cache:
+      entity = await client.get_input_entity(key)
+      full = await client.get_entity(entity)
+      _channel_id_cache[key] = full.id
+      id_to_feeds[full.id] = feeds_list
   - Remove Phase 1 handler
   - Register handler with full id_to_feeds
   - Log: "Резолвлено каналов по ID: X из Y"
@@ -347,30 +352,31 @@ Phase 2 – resolve_ids=True (called after dialogs loaded):
 
 ### Message Handler (`_process_message`)
 
-```python
+```
 async def _process_message(event, channel_to_feeds, id_to_feeds):
     chat = event.chat
     chat_id = chat.id  # positive numeric ID from Telethon
 
-    # Fast path: numeric ID match
+    # Fast path: numeric ID match (most cases after Phase 2)
     if chat_id in id_to_feeds:
         feeds_for_channel = id_to_feeds[chat_id]
-        source_name = getattr(chat, "title", str(chat_id))
     else:
-        # Fallback: string key match
-        username = getattr(chat, "username", None)
-        key = f"@{username}" if username else f"-100{chat_id}"
-        if key not in channel_to_feeds and f"-100{chat_id}" not in channel_to_feeds:
-            logger.debug("Не в фидах: ...")
-            return
-        feeds_for_channel = channel_to_feeds.get(key) or channel_to_feeds.get(...)
+        # Fallback: string key match (e.g. Phase 1, or username not resolved)
+        chat_username = f"@{chat.username}" if chat.username else None
+        for channel_key, feeds_list in channel_to_feeds.items():
+            if chat_username and channel_key.lower() == chat_username.lower():
+                feeds_for_channel = feeds_list; break
+            if str(chat.id) in channel_key or f"-100{chat.id}" in channel_key:
+                feeds_for_channel = feeds_list; break
+        else:
+            logger.debug("Не в фидах: ..."); return
 
-    # Mark source as read (best-effort)
-    try: await client.send_read_acknowledge(chat, ...)
+    # Mark source as read (best-effort, silent failure)
+    try: await client.send_read_acknowledge(chat, message)
     except: pass
 
     # Route by message type
-    if event.message.grouped_id:
+    if message.grouped_id:
         await _buffer_media_group(message, source_name, feeds_for_channel)
     else:
         await _process_single(message, source_name, feeds_for_channel)
@@ -402,7 +408,7 @@ On each part of an album (message.grouped_id == gid):
 After sleep(1.0):
   group = _media_groups.pop(gid)
   messages = sorted(group.messages, key=lambda m: m.id)
-  Extract text from first message that has text
+  Extract text from first message that has text (others may be pure media)
   For each feed: filter → forward as album via relay
 ```
 
@@ -418,7 +424,7 @@ Telegram only marks messages as unread (and increments badge counter) when they 
 
 | Requirement | Who | How |
 |-------------|-----|-----|
-| Bot token is admin | Service owner | Manually in channel settings, with "Add Admins" right |
+| Bot token is admin with "Add Admins" right | Service owner | Manually in channel settings |
 | Bot invite link | Service owner | Set in `RELAY_INVITE_LINK` env var |
 | Each userbot is admin | Automatic | `_init_bot_relay()` on `start_monitoring()` |
 
@@ -429,22 +435,26 @@ Telegram only marks messages as unread (and increments badge counter) when they 
 2. Check RELAY_CHANNEL_ID set; log warning + return if not
 3. If RELAY_INVITE_LINK set:
      await client.join_channel(RELAY_INVITE_LINK)
-     except: pass  # already member or other — ignore
+     except: pass  # already member — ignore
 4. entity = await _resolve_entity_telethon(RELAY_CHANNEL_ID)
-5. relay_chat_id = -(1000000000000 + entity.id)  # canonical Bot API format
-6. POST /promoteChatMember {
-     chat_id: relay_chat_id,
-     user_id: _userbot_id,
+5. full = await client.get_entity(entity)
+6. relay_chat_id:
+     if RELAY_CHANNEL_RAW.startswith('-100') → int(RELAY_CHANNEL_RAW)
+     else → -(1000000000000 + full.id)
+7. POST /promoteChatMember {
+     chat_id: relay_chat_id, user_id: _userbot_id,
      can_post_messages: True, can_edit_messages: True, can_delete_messages: True
    }
-   if "owner" in error_description → ignore (already has all rights)
-7. Log: "Relay готов: канал {id} «{title}»"
+   if ok OR "owner" in description.lower() → pass (success or already owner)
+   else → log warning (non-fatal; relay may still work)
+8. Log: "Relay готов: канал {id} «{title}»"
+   On exception: _bot_entity = None, _relay_chat_id = None, log warning
 ```
 
 ### Single Message Forward
 
 ```
-# Step 1: Userbot → Relay
+# Step 1: Userbot → Relay (silent=True to suppress relay-channel notification)
 relay_messages = await client.forward_messages(relay_entity, [msg], silent=True)
 relay_id = relay_messages[0].id
 
@@ -455,14 +465,14 @@ POST /forwardMessage {
   message_id: relay_id
 }
 
-# Step 3: Cleanup
+# Step 3: Cleanup (always, even if step 2 failed)
 await client.delete_messages(relay_entity, [relay_id])
 ```
 
 ### Album Forward
 
 ```
-# Step 1: Userbot → Relay (all messages)
+# Step 1: Userbot → Relay (all messages at once)
 relay_messages = await client.forward_messages(relay_entity, messages, silent=True)
 relay_ids = [m.id for m in relay_messages]
 
@@ -482,7 +492,7 @@ await client.delete_messages(relay_entity, relay_ids)
 Any exception in the relay path triggers direct userbot forward:
 ```python
 await client.forward_messages(destination_entity, messages)
-# No unread counter, but message delivered
+# No unread counter, but message is delivered
 ```
 
 ---
@@ -516,20 +526,40 @@ is_ad(text, keywords, use_ai=False) → (bool, str):
 
 | Rule | Logic | Matches |
 |------|-------|---------|
-| `реклама` | single word | any message containing "реклама" (any case) |
+| `реклама` | single word | any message containing "реклама" (case-insensitive) |
 | `скидка+купить` | AND | message must contain BOTH "скидка" AND "купить" |
 | `промокод+10%` | AND | message must contain "промокод" AND "10%" |
 
 ### Limitations
 
 - No wildcard / regex support
-- No OR logic between rules (each rule is independent OR; within a rule it's AND)
-- No word boundary check (substring match: "скидочный" matches rule "скидок")
-- `use_ai` parameter accepted but ignored; AI filtering removed
+- No OR logic within a rule (each rule is separate; within a rule it's AND only)
+- Substring match, no word boundaries: "скидочный" matches rule "скидок"
+- `use_ai` parameter accepted but ignored; AI filtering removed from implementation
 
 ---
 
 ## 11. Bot Commands UI & State Machine
+
+### Navigation Pattern
+
+All screen transitions use `_show(chat_id, msg_id, text, markup)`:
+
+```
+_show(chat_id, msg_id, text, markup, parse_mode="HTML"):
+  if msg_id:
+    payload = {chat_id, message_id: msg_id, text, parse_mode,
+               disable_web_page_preview: True, reply_markup: markup}
+    result = await _api("editMessageText", **payload)
+    if result["ok"]:
+      return                          # ✅ edited in place, no scroll jump
+    if "message is not modified" in result["description"]:
+      return                          # ✅ already up to date, no action needed
+    await _delete(chat_id, msg_id)    # stale/missing message — clean up
+  await _send(chat_id, text, markup)  # new message as fallback
+```
+
+`editMessageText` is the primary path — the bot message stays at its position in the chat. Fallback to delete+send covers the case where `msg_id` is unavailable (initial open via command) or the message was deleted externally.
 
 ### Screens
 
@@ -542,7 +572,7 @@ is_ad(text, keywords, use_ai=False) → (bool, str):
 | Filters | `filters:{id}` | Keyword list | ➕ Add, ➖ Delete, ◀️ Back |
 | Filter delete | `kw_del_list:{id}` | Keyword list, each tappable | [keyword buttons], ◀️ Back |
 | Delete confirm | `delete:{id}` | "Delete feed X?" | ✅ Yes (`delete_ok:{id}`), ❌ No |
-| Settings | `/settings`, `settings` | api_id, api_hash (masked \*\*\*), auth status | 🔑 Enter api_id, 🔑 Enter api_hash, 📷 QR login, 📱 Phone login, ◀️ Back |
+| Settings | `/settings`, `settings` callback | api_id, api_hash (first 6 chars + `****`), auth status | 🔑 Enter api_id, 🔑 Enter api_hash, 📷 QR login, ◀️ Back |
 
 ### State Machine
 
@@ -561,8 +591,8 @@ _states: dict[int, {"step": str, "ctx": dict}]
 | `auth_2fa_qr` | Password string | confirm_2fa(password) | "Неверный пароль" |
 | `new_feed_name` | Non-empty string | create_feed(), show_feed | — |
 | `rename_feed` | Non-empty string | update_feed(name=...) | — |
-| `set_dest` | Forwarded message | update_feed(destination=...), reload | "Перешлите сообщение из канала" |
-| `add_channel` | Forwarded message | add_channel(), reload | "Перешлите сообщение из канала" |
+| `set_dest` | Forwarded message | update_feed(destination=channel_id), reload | "Перешлите сообщение из канала" |
+| `add_channel` | Forwarded message | add_channel(@username or channel_id), reload | "Перешлите сообщение из канала" |
 | `add_keyword` | Non-empty string | add_keyword() | — |
 
 ### Commands
@@ -571,7 +601,7 @@ _states: dict[int, {"step": str, "ctx": dict}]
 |---------|--------|
 | `/start`, `/feedlist` | Show feed list |
 | `/settings` | Show settings screen |
-| `/help` | Send static 8-step setup guide |
+| `/help` | Send static setup guide (8 steps) |
 | `/esc` | Cancel active state; route back; cancel QR task if pending |
 
 ### Cancel Routing (`/esc`)
@@ -584,27 +614,17 @@ step = auth_qr_wait:
   → task.cancel()
   → show_settings()
 
-step in (new_feed_name,):
-  → show_feed_list()
-
-step in (rename_feed, set_dest, toggle, delete):
+step in (rename_feed, set_dest):
   → show_feed(feed_id from ctx)
 
-step in (add_channel, ch_del_list):
+step = add_channel:
   → show_channels(feed_id from ctx)
 
-step in (add_keyword, kw_del_list):
+step = add_keyword:
   → show_filters(feed_id from ctx)
-```
 
-### Send-and-Delete Pattern
-
-All screen updates use `_show(chat_id, msg_id, text, markup)`:
-
-```
-1. if msg_id: await bot_api.deleteMessage(chat_id, msg_id)
-2. response = await bot_api.sendMessage(chat_id, text, reply_markup=markup, parse_mode="HTML")
-3. return new msg_id  (stored for next _show call)
+default:
+  → show_feed_list()
 ```
 
 ---
@@ -618,21 +638,19 @@ normalize_channel(channel: str) -> str:
   ch = channel.strip()
 
   if "t.me/+" in ch or "joinchat" in ch:
-    return ch  # invite link — keep as-is
+    return ch  # invite link — keep as-is (Telethon resolves directly)
 
   if "t.me/c/" in ch:
     # Private channel: https://t.me/c/1234567890/5
     parts = ch.split("t.me/c/")[-1].strip("/").split("/")
     channel_id = parts[0]
-    if channel_id.isdigit():
-      return f"-100{channel_id}"
-    return ch
+    return f"-100{channel_id}" if channel_id.isdigit() else ch
 
   if "t.me/" in ch:
     ch = ch.split("t.me/")[-1].strip("/")
 
   if ch.lstrip("@").lstrip("-").isdigit():
-    return ch.lstrip("@")
+    return ch.lstrip("@")   # strip stray @ from numeric IDs
 
   if ch and not ch.startswith("@"):
     ch = "@" + ch
@@ -659,32 +677,35 @@ Total: always 3 queries regardless of feed count
 offset = 0
 while True:
   try:
-    response = POST /getUpdates {offset: offset, timeout: 30, limit: 100}
-    # http timeout: 35s (30s poll + 5s buffer)
-    
+    response = POST /getUpdates {
+      offset: offset, timeout: 30,
+      allowed_updates: ["message", "callback_query"]
+    }
+    # httpx timeout: 35.0s (30s poll window + 5s buffer)
+
     for update in response.result:
       offset = update.update_id + 1
       try:
-        if update.message: await handle_message(chat_id, message, sm)
-        if update.callback_query: await handle_callback(callback, sm)
+        if "callback_query" in update: await handle_callback(update.callback_query, sm)
+        elif "message" in update: await handle_message(from_id, message, sm)
       except Exception as e:
         logger.error(f"Ошибка обработки update {id}: {e}")
+
   except asyncio.CancelledError:
-    logger.error("Bot commands polling остановлен")
-    return
+    logger.info("Bot commands polling остановлен"); return
   except Exception as e:
-    logger.warning(f"Polling ошибка: {e}")
-    await asyncio.sleep(5)  # backoff
+    logger.error(f"Polling ошибка: {e}")
+    await asyncio.sleep(5)  # backoff before retry
 ```
 
 ### Relay Numeric ID Calculation
 
 ```
 # Telethon returns entity.id as positive (e.g., 1234567890)
-# Bot API and Telegram expect full format: -100{entity.id}
+# Bot API requires full format: -100{entity.id}
 
 if RELAY_CHANNEL_RAW.startswith('-100'):
-  relay_chat_id = int(RELAY_CHANNEL_RAW)
+  relay_chat_id = int(RELAY_CHANNEL_RAW)   # already canonical
 else:
   full = await client.get_entity(entity)
   relay_chat_id = -(1000000000000 + full.id)
@@ -699,11 +720,13 @@ else:
 | Media group delay | 1.0 s | `bot.py` `_process_media_group_later` | Wait for all album parts from Telegram |
 | Keepalive interval | 30 s | `bot.py` `_updates_keepalive` | GetStateRequest interval |
 | QR auth timeout | 120 s | `bot.py` `wait_for_qr_scan` | Max wait for QR scan |
-| HTTP timeout (general) | 10.0 s | `bot.py` `_api()`, auth helpers | Standard Bot API calls |
-| HTTP timeout (relay forward) | 15.0 s | `bot.py` relay path | Slower relay forward operation |
+| HTTP timeout (general) | 10.0 s | `bot.py` `_init_bot_relay`, `bot_commands.py` `_api()` | Standard Bot API calls |
+| HTTP timeout (relay forward) | 15.0 s | `bot.py` relay forward path | Slower relay forward operation |
 | HTTP timeout (polling) | 35.0 s | `bot_commands.py` `run_polling` | 30s long-poll + 5s buffer |
 | Polling timeout param | 30 s | `bot_commands.py` `getUpdates` | Telegram long-poll window |
 | Polling error backoff | 5 s | `bot_commands.py` | Sleep after exception |
+| api_hash min length | 10 chars | `bot_commands.py` | Validation threshold |
+| QR image size | 300×300 px | `bot_commands.py` | api.qrserver.com query param |
 | Host port | 8001 | `docker-compose.yml` | External HTTP port |
 | Container port | 8000 | `Dockerfile`, `docker-compose.yml` | Internal Uvicorn port |
 | Health check interval | 30 s | `docker-compose.yml` | Docker health probe interval |
@@ -717,7 +740,7 @@ else:
 
 | Variable | Required | Default | Used in | Effect if missing |
 |----------|----------|---------|---------|-------------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | `""` | `bot.py` line 37 | Relay disabled; no bot commands |
+| `TELEGRAM_BOT_TOKEN` | Yes | `""` | `bot.py` line 37, `bot_commands.py` | Relay disabled; no bot commands |
 | `RELAY_CHANNEL_ID` | Recommended | `""` | `bot.py` line 43 | Relay disabled; no unread counters |
 | `RELAY_INVITE_LINK` | Recommended | `""` | `bot.py` line 44 | Userbot won't auto-join relay channel |
 
@@ -790,10 +813,11 @@ RELAY_INVITE_LINK=https://t.me/+AbCdEfGhIjKlMnOp
 
 ```bash
 mkdir -p data
-chmod 777 data/           # Docker container runs as root; data dir must be writable
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f    # Verify: "База данных инициализирована", "polling запущен"
 ```
+
+> **After any code change always use `--build`** — the source code is baked into the image at build time (`COPY app/ ./app/`). Plain `docker compose up -d` reuses the old image.
 
 ### First User Setup (in Telegram)
 

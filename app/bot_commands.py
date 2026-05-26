@@ -102,9 +102,25 @@ async def _delete(chat_id: int, message_id: int):
 
 
 async def _show(chat_id: int, msg_id: int | None, text: str, markup=None, parse_mode: str = "HTML"):
-    """Удаляет старое сообщение и отправляет новое (всегда внизу чата)."""
+    """Редактирует существующее сообщение (навигация без прыжков).
+    Если msg_id не задан или редактирование не удалось — отправляет новое."""
     if msg_id:
-        await _delete(chat_id, msg_id)
+        payload: dict = {
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        if markup:
+            payload["reply_markup"] = markup
+        result = await _api("editMessageText", **payload)
+        if result.get("ok"):
+            return
+        # Сообщение не изменилось или недоступно — отправляем новое
+        err = result.get("description", "")
+        if "message is not modified" not in err:
+            await _delete(chat_id, msg_id)
     await _send(chat_id, text, markup, parse_mode)
 
 
