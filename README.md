@@ -1,5 +1,11 @@
 # PureFeed
 
+[![Telegram Bot](https://img.shields.io/badge/@pure__feed__bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/pure_feed_bot)
+![Python](https://img.shields.io/badge/Python_3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+
 Telegram-бот для агрегации каналов с фильтрацией рекламы. Подключается к Telegram-аккаунту пользователя через userbot (Telethon + MTProto), мониторит подписанные каналы, фильтрует сообщения по ключевым словам и пересылает чистый контент в приватные каналы назначения. Управление — через Telegram-бота.
 
 Мультипользовательский: каждый пользователь авторизует свой аккаунт и управляет своими фидами независимо.
@@ -72,10 +78,10 @@ docker compose logs -f
 
 | Команда | Действие |
 |---------|----------|
-| `/feedlist` | Управление фидами и запуск мониторинга |
-| `/settings` | Авторизация userbot |
-| `/help` | Подробная справка |
-| `/esc` | Отмена текущего ввода |
+| `/feedlist` | 📋 Управление фидами и запуск мониторинга |
+| `/settings` | ⚙️ Авторизация userbot |
+| `/help` | 📖 Подробная справка |
+| `/esc` | ✖️ Отмена текущего ввода |
 
 ---
 
