@@ -198,8 +198,8 @@ async def show_feed(chat_id: int, feed_id: int, msg_id: int | None):
     dest = feed["destination_channel"] or "не задан"
     text = (
         f"📌 <b>{feed['name']}</b>\n\n"
-        f"📺 Назначение: <code>{dest}</code>\n"
-        f"📡 Каналов: {len(feed['channels'])}\n"
+        f"📺 Пересылка в: <code>{dest}</code>\n"
+        f"📡 Источники: {len(feed['channels'])}\n"
         f"⬛ Чёрный список: {len(feed['keywords'])}\n"
         f"⬜ Белый список: {len(feed.get('whitelist', []))}\n"
         f"Статус: {'✅ активен' if enabled else '❌ выключен'}"
