@@ -57,9 +57,9 @@ _HELP_TEXT = (
     "4️⃣ Добавьте источники\n"
     "📡 Источники → ➕ Добавить → перешлите сообщение из канала-источника.\n\n"
     "5️⃣ Настройте фильтры (необязательно)\n"
-    "🔍 Чёрный список → ➕ Добавить → введите слово-стоп.\n"
+    "⬛ Чёрный список → ➕ Добавить → введите слово-стоп.\n"
     "Несколько слов через <code>+</code>: <code>скидка+купить</code>\n\n"
-    "✅ Белый список — слова-исключения: если пост попал под чёрный список, "
+    "⬜ Белый список — слова-исключения: если пост попал под чёрный список, "
     "но содержит слово из белого — он всё равно пропускается.\n\n"
     "<b>Команды:</b>\n"
     "/feedlist — управление фидами\n"
@@ -200,15 +200,15 @@ async def show_feed(chat_id: int, feed_id: int, msg_id: int | None):
         f"📌 <b>{feed['name']}</b>\n\n"
         f"📺 Назначение: <code>{dest}</code>\n"
         f"📡 Каналов: {len(feed['channels'])}\n"
-        f"🔍 Чёрный список: {len(feed['keywords'])}\n"
-        f"✅ Белый список: {len(feed.get('whitelist', []))}\n"
+        f"⬛ Чёрный список: {len(feed['keywords'])}\n"
+        f"⬜ Белый список: {len(feed.get('whitelist', []))}\n"
         f"Статус: {'✅ активен' if enabled else '❌ выключен'}"
     )
     markup = {"inline_keyboard": [
         [{"text": "📺 Пересылать в ...",  "callback_data": f"setdest:{feed_id}"}],
         [{"text": "📡 Источники",          "callback_data": f"channels:{feed_id}"}],
-        [{"text": "🔍 Чёрный список",      "callback_data": f"filters:{feed_id}"}],
-        [{"text": "✅ Белый список",        "callback_data": f"whitelist:{feed_id}"}],
+        [{"text": "⬛ Чёрный список",      "callback_data": f"filters:{feed_id}"}],
+        [{"text": "⬜ Белый список",        "callback_data": f"whitelist:{feed_id}"}],
         [
             {"text": "✏️ Название", "callback_data": f"rename:{feed_id}"},
             {"text": "🗑 Удалить",   "callback_data": f"delete:{feed_id}"},
