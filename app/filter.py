@@ -32,10 +32,22 @@ class AdFilter:
         text: str,
         keywords: list[str],
         use_ai: bool = False,
+        whitelist: list[str] | None = None,
     ) -> tuple[bool, str]:
         if not text or not text.strip():
             return False, ""
-        return self._check_keywords(text, keywords)
+
+        matched, reason = self._check_keywords(text, keywords)
+        if not matched:
+            return False, ""
+
+        # Чёрный список сработал — проверяем белый список
+        if whitelist:
+            wl_matched, _ = self._check_keywords(text, whitelist)
+            if wl_matched:
+                return False, ""
+
+        return True, reason
 
 
 # Глобальный экземпляр фильтра

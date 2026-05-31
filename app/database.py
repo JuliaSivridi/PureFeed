@@ -53,6 +53,16 @@ async def init_db():
             )
         """)
 
+        # Таблица ключевых слов белого списка
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feed_id INTEGER NOT NULL,
+                keyword TEXT NOT NULL,
+                FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+            )
+        """)
+
         # Таблица для хранения последнего обработанного сообщения по каждому каналу
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channel_last_seen (
@@ -86,6 +96,7 @@ def _feed_row_to_dict(row) -> dict:
         "created_at": row[6],
         "channels": [],
         "keywords": [],
+        "whitelist": [],
     }
 
 
@@ -131,6 +142,14 @@ async def get_all_feeds(user_id: int | None = None) -> list[dict]:
         for row in await cursor.fetchall():
             feed_map[row[0]]["keywords"].append(row[1])
 
+        # Получаем белый список для всех фидов одним запросом
+        cursor = await db.execute(
+            f"SELECT feed_id, keyword FROM whitelist_keywords WHERE feed_id IN ({placeholders})",
+            feed_ids,
+        )
+        for row in await cursor.fetchall():
+            feed_map[row[0]]["whitelist"].append(row[1])
+
         return feeds
 
 
@@ -166,6 +185,13 @@ async def get_feed(feed_id: int, user_id: int | None = None) -> Optional[dict]:
             (feed_id,),
         )
         feed["keywords"] = [r[0] for r in await cursor.fetchall()]
+
+        # Белый список фида
+        cursor = await db.execute(
+            "SELECT keyword FROM whitelist_keywords WHERE feed_id = ?",
+            (feed_id,),
+        )
+        feed["whitelist"] = [r[0] for r in await cursor.fetchall()]
 
         return feed
 
@@ -342,6 +368,39 @@ async def add_keyword(feed_id: int, keyword: str) -> bool:
         )
         await db.commit()
         return True
+
+
+async def add_whitelist_keyword(feed_id: int, keyword: str) -> bool:
+    """Добавляет слово в белый список фида. Возвращает False если уже существует."""
+    kw = keyword.strip().lower()
+    if not kw:
+        return False
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM whitelist_keywords WHERE feed_id = ? AND keyword = ?",
+            (feed_id, kw),
+        )
+        if await cursor.fetchone():
+            return False
+
+        await db.execute(
+            "INSERT INTO whitelist_keywords (feed_id, keyword) VALUES (?, ?)",
+            (feed_id, kw),
+        )
+        await db.commit()
+        return True
+
+
+async def remove_whitelist_keyword(feed_id: int, keyword: str) -> bool:
+    """Удаляет слово из белого списка фида."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM whitelist_keywords WHERE feed_id = ? AND keyword = ?",
+            (feed_id, keyword.strip().lower()),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_last_seen_id(channel: str) -> int:

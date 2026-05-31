@@ -15,6 +15,7 @@ from telethon.errors import SessionPasswordNeededError
 from app.database import (
     get_feed, get_all_feeds, create_feed, delete_feed, update_feed,
     add_channel, remove_channel, add_keyword, remove_keyword,
+    add_whitelist_keyword, remove_whitelist_keyword,
     get_user_settings, save_user_settings,
 )
 
@@ -52,12 +53,14 @@ _HELP_TEXT = (
     "Приватный Telegram-канал, куда будут пересылаться новости.\n"
     "Добавьте этого бота как администратора с правом публикации сообщений.\n\n"
     "3️⃣ Укажите канал назначения в фиде\n"
-    "Управление фидом → 📺 Канал назначения → перешлите любое сообщение из этого канала.\n\n"
+    "Управление фидом → 📺 Пересылать в ... → перешлите любое сообщение из этого канала.\n\n"
     "4️⃣ Добавьте источники\n"
-    "📡 Управление каналами → ➕ Добавить → перешлите сообщение из канала-источника.\n\n"
+    "📡 Источники → ➕ Добавить → перешлите сообщение из канала-источника.\n\n"
     "5️⃣ Настройте фильтры (необязательно)\n"
-    "🔍 Управление фильтрами → ➕ Добавить → введите слово-стоп.\n"
+    "🔍 Чёрный список → ➕ Добавить → введите слово-стоп.\n"
     "Несколько слов через <code>+</code>: <code>скидка+купить</code>\n\n"
+    "✅ Белый список — слова-исключения: если пост попал под чёрный список, "
+    "но содержит слово из белого — он всё равно пропускается.\n\n"
     "<b>Команды:</b>\n"
     "/feedlist — управление фидами\n"
     "/settings — настройки userbot\n"
@@ -197,18 +200,20 @@ async def show_feed(chat_id: int, feed_id: int, msg_id: int | None):
         f"📌 <b>{feed['name']}</b>\n\n"
         f"📺 Назначение: <code>{dest}</code>\n"
         f"📡 Каналов: {len(feed['channels'])}\n"
-        f"🔍 Фильтров: {len(feed['keywords'])}\n"
+        f"🔍 Чёрный список: {len(feed['keywords'])}\n"
+        f"✅ Белый список: {len(feed.get('whitelist', []))}\n"
         f"Статус: {'✅ активен' if enabled else '❌ выключен'}"
     )
     markup = {"inline_keyboard": [
-        [{"text": "📺 Канал назначения",     "callback_data": f"setdest:{feed_id}"}],
-        [{"text": "📡 Управление каналами",  "callback_data": f"channels:{feed_id}"}],
-        [{"text": "🔍 Управление фильтрами", "callback_data": f"filters:{feed_id}"}],
+        [{"text": "📺 Пересылать в ...",  "callback_data": f"setdest:{feed_id}"}],
+        [{"text": "📡 Источники",          "callback_data": f"channels:{feed_id}"}],
+        [{"text": "🔍 Чёрный список",      "callback_data": f"filters:{feed_id}"}],
+        [{"text": "✅ Белый список",        "callback_data": f"whitelist:{feed_id}"}],
         [
-            {"text": "⏸ Стоп" if enabled else "▶️ Старт", "callback_data": f"toggle:{feed_id}"},
-            {"text": "✏️ Название",                         "callback_data": f"rename:{feed_id}"},
-            {"text": "🗑 Удалить",                          "callback_data": f"delete:{feed_id}"},
+            {"text": "✏️ Название", "callback_data": f"rename:{feed_id}"},
+            {"text": "🗑 Удалить",   "callback_data": f"delete:{feed_id}"},
         ],
+        [{"text": "⏹ Стоп" if enabled else "▶️ Старт", "callback_data": f"toggle:{feed_id}"}],
         [{"text": "◀️ Назад", "callback_data": "back:feeds"}],
     ]}
     await _show(chat_id, msg_id, text, markup)
@@ -250,8 +255,8 @@ async def show_filters(chat_id: int, feed_id: int, msg_id: int | None):
     if not feed:
         return
     keywords = feed["keywords"]
-    kw_list = "\n".join(f"• <code>{k}</code>" for k in keywords) if keywords else "Нет фильтров"
-    text = f"🔍 <b>{feed['name']} — Фильтры</b>\n\n{kw_list}"
+    kw_list = "\n".join(f"• <code>{k}</code>" for k in keywords) if keywords else "Нет правил"
+    text = f"🔍 <b>{feed['name']} — Чёрный список</b>\n\n{kw_list}"
     markup = {"inline_keyboard": [
         [
             {"text": "➕ Добавить", "callback_data": f"kw_add:{feed_id}"},
@@ -276,6 +281,40 @@ async def show_filter_delete_list(chat_id: int, feed_id: int, msg_id: int | None
         for k in keywords
     ]
     buttons.append([{"text": "◀️ Назад", "callback_data": f"filters:{feed_id}"}])
+    await _show(chat_id, msg_id, text, {"inline_keyboard": buttons})
+
+
+async def show_whitelist(chat_id: int, feed_id: int, msg_id: int | None):
+    feed = await get_feed(feed_id, user_id=chat_id)
+    if not feed:
+        return
+    items = feed.get("whitelist", [])
+    wl_list = "\n".join(f"• <code>{k}</code>" for k in items) if items else "Нет правил"
+    text = f"✅ <b>{feed['name']} — Белый список</b>\n\n{wl_list}"
+    markup = {"inline_keyboard": [
+        [
+            {"text": "➕ Добавить", "callback_data": f"wl_add:{feed_id}"},
+            {"text": "➖ Удалить",  "callback_data": f"wl_del_list:{feed_id}"},
+        ],
+        [{"text": "◀️ Назад", "callback_data": f"feed:{feed_id}"}],
+    ]}
+    await _show(chat_id, msg_id, text, markup)
+
+
+async def show_whitelist_delete_list(chat_id: int, feed_id: int, msg_id: int | None):
+    feed = await get_feed(feed_id, user_id=chat_id)
+    if not feed:
+        return
+    items = feed.get("whitelist", [])
+    if not items:
+        await _send(chat_id, "Белый список пуст.")
+        return
+    text = f"✅ <b>{feed['name']}</b>\n\nВыберите правило для удаления:"
+    buttons = [
+        [{"text": k, "callback_data": f"wl_del:{feed_id}:{k[:50]}"}]
+        for k in items
+    ]
+    buttons.append([{"text": "◀️ Назад", "callback_data": f"whitelist:{feed_id}"}])
     await _show(chat_id, msg_id, text, {"inline_keyboard": buttons})
 
 
@@ -307,6 +346,8 @@ async def _cancel(chat_id: int, step: str, ctx: dict, sm: "SessionManager"):
         await show_channels(chat_id, feed_id, msg_id)
     elif step == "add_keyword":
         await show_filters(chat_id, feed_id, msg_id)
+    elif step == "add_whitelist":
+        await show_whitelist(chat_id, feed_id, msg_id)
     elif step in ("rename_feed", "set_dest"):
         await show_feed(chat_id, feed_id, msg_id)
     elif step in ("set_api_id", "set_api_hash", "auth_phone", "auth_code", "auth_2fa", "auth_2fa_qr"):
@@ -537,10 +578,20 @@ async def handle_message(chat_id: int, message: dict, sm: "SessionManager"):
         ok = await add_keyword(feed_id, text)
         _clear_state(chat_id)
         if ok:
-            await _send(chat_id, f"✅ Фильтр добавлен: <code>{text}</code>", parse_mode="HTML")
+            await _send(chat_id, f"✅ Добавлено в чёрный список: <code>{text}</code>", parse_mode="HTML")
         else:
-            await _send(chat_id, "⚠️ Такой фильтр уже есть.")
+            await _send(chat_id, "⚠️ Такое правило уже есть.")
         await show_filters(chat_id, feed_id, ctx.get("msg_id"))
+
+    elif step == "add_whitelist":
+        feed_id = ctx["feed_id"]
+        ok = await add_whitelist_keyword(feed_id, text)
+        _clear_state(chat_id)
+        if ok:
+            await _send(chat_id, f"✅ Добавлено в белый список: <code>{text}</code>", parse_mode="HTML")
+        else:
+            await _send(chat_id, "⚠️ Такое правило уже есть.")
+        await show_whitelist(chat_id, feed_id, ctx.get("msg_id"))
 
 
 async def handle_callback(callback: dict, sm: "SessionManager"):
@@ -677,12 +728,39 @@ async def handle_callback(callback: dict, sm: "SessionManager"):
         feed_id = int(data.split(":")[1])
         await show_filters(chat_id, feed_id, msg_id)
 
+    elif data.startswith("whitelist:"):
+        feed_id = int(data.split(":")[1])
+        await show_whitelist(chat_id, feed_id, msg_id)
+
+    elif data.startswith("wl_add:"):
+        feed_id = int(data.split(":")[1])
+        _set_state(chat_id, "add_whitelist", {"feed_id": feed_id, "msg_id": msg_id})
+        await _send(
+            chat_id,
+            "✅ Введите правило белого списка.\n\n"
+            "Если пост заблокирован чёрным списком, но содержит это правило — он будет пропущен.\n\n"
+            "Несколько слов через <code>+</code> = все должны присутствовать:\n"
+            "• <code>max.ru/spizivyaz</code>\n"
+            "• <code>вязание+крючком</code>" + _CANCEL_HINT,
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("wl_del_list:"):
+        feed_id = int(data.split(":")[1])
+        await show_whitelist_delete_list(chat_id, feed_id, msg_id)
+
+    elif data.startswith("wl_del:"):
+        parts = data.split(":", 2)
+        feed_id, keyword = int(parts[1]), parts[2]
+        await remove_whitelist_keyword(feed_id, keyword)
+        await show_whitelist(chat_id, feed_id, msg_id)
+
     elif data.startswith("kw_add:"):
         feed_id = int(data.split(":")[1])
         _set_state(chat_id, "add_keyword", {"feed_id": feed_id, "msg_id": msg_id})
         await _send(
             chat_id,
-            "🔍 Введите ключевое слово или правило.\n\n"
+            "🔍 Введите правило чёрного списка.\n\n"
             "Несколько слов через <code>+</code> = все должны присутствовать:\n"
             "• <code>промокод</code>\n"
             "• <code>скидка+купить</code>" + _CANCEL_HINT,

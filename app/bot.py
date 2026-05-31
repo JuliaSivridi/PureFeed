@@ -461,6 +461,7 @@ class TelegramBot:
                         text=text,
                         keywords=feed.get("keywords", []),
                         use_ai=feed.get("use_ai_filter", False),
+                        whitelist=feed.get("whitelist", []),
                     )
                     if is_ad:
                         logger.info(
