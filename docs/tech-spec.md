@@ -1,9 +1,30 @@
 # PureFeed — Technical Specification
 
-**Version:** 1.1 (May 2026)  
+**Version:** 1.2 (June 2026)  
 **Repository:** github.com/JuliaSivridi/PureFeed  
 **Bot:** @pure_feed_bot  
 **Stack:** Python 3.11 · FastAPI · Telethon · SQLite · Docker
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [Tech Stack](#2-tech-stack)
+3. [Architecture](#3-architecture)
+4. [Package / Folder Structure](#4-package--folder-structure)
+5. [Data Model](#5-data-model)
+6. [Database / Storage Schema](#6-database--storage-schema)
+7. [Authentication & First-Launch Setup](#7-authentication--first-launch-setup)
+8. [Monitoring Engine](#8-monitoring-engine)
+9. [Relay & Unread Counters](#9-relay--unread-counters)
+10. [Filtering Engine](#10-filtering-engine)
+11. [Bot Commands UI & State Machine](#11-bot-commands-ui--state-machine)
+12. [Key Algorithms](#12-key-algorithms)
+13. [All Numeric Constants](#13-all-numeric-constants)
+14. [Environment Variables](#14-environment-variables)
+15. [Logging Reference](#15-logging-reference)
+16. [Setup & Deployment](#16-setup--deployment-first-time-developer-guide)
 
 ---
 
@@ -138,8 +159,7 @@ Pure_Feed/
 │   └── telegram_*.session   # Telethon session file per user
 ├── docs/
 │   ├── tech-spec.md         # This file
-│   ├── tech-spec.html       # HTML version of this spec
-│   └── tech-spec-example.css # Stylesheet for HTML spec
+│   └── tech-spec.html       # HTML version (CSS embedded)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -167,6 +187,7 @@ Represents one user's filtering configuration: a set of source channels → one 
 | created_at | str | utcnow() | ISO 8601 timestamp |
 | channels | list[str] | [] | Virtual: loaded from `source_channels` table |
 | keywords | list[str] | [] | Virtual: loaded from `filter_keywords` table |
+| whitelist | list[str] | [] | Virtual: loaded from `whitelist_keywords` table |
 
 ### UserSettings
 
@@ -190,7 +211,17 @@ Many-to-one with Feed. Stores each monitored source channel.
 
 ### FilterKeyword
 
-Many-to-one with Feed. Stores each ad-detection rule.
+Many-to-one with Feed. Stores each blacklist rule.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | int | PK autoincrement |
+| feed_id | int | FK → feeds.id ON DELETE CASCADE |
+| keyword | str | Stored lowercase; single word or `word+word` AND-rule |
+
+### WhitelistKeyword
+
+Many-to-one with Feed. Stores each whitelist exception rule. If a message matches a blacklist rule but also matches a whitelist rule, it is forwarded.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -243,6 +274,13 @@ CREATE TABLE channel_last_seen (
     updated_at       TEXT NOT NULL
 );
 
+CREATE TABLE whitelist_keywords (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_id INTEGER NOT NULL,
+    keyword TEXT NOT NULL,
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+);
+
 CREATE TABLE user_settings (
     user_id  INTEGER PRIMARY KEY,
     api_id   INTEGER,
@@ -252,7 +290,7 @@ CREATE TABLE user_settings (
 
 **Migration:** On startup, `init_db()` attempts `ALTER TABLE feeds ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`. The `except` block silently ignores `OperationalError` if column exists. No formal version tracking.
 
-**Bulk read pattern:** `get_all_feeds()` fetches feeds, then channels, then keywords in **three queries** (not N+1) using `WHERE feed_id IN (?,?,...)`.
+**Bulk read pattern:** `get_all_feeds()` fetches feeds, then channels, then keywords, then whitelist in **four queries** (not N+1) using `WHERE feed_id IN (?,?,...)`.
 
 ### Channel Format Reference
 
@@ -504,21 +542,30 @@ await client.forward_messages(destination_entity, messages)
 ### Algorithm
 
 ```
-is_ad(text, keywords, use_ai=False) → (bool, str):
+is_ad(text, keywords, use_ai=False, whitelist=None) → (bool, str):
   if not text or not text.strip():
     return (False, "")          # Empty/media-only messages always pass
 
-  text_lower = text.lower()
+  matched, reason = _check_keywords(text, keywords)
+  if not matched:
+    return (False, "")
 
+  # Blacklist matched — check whitelist override
+  if whitelist:
+    wl_matched, _ = _check_keywords(text, whitelist)
+    if wl_matched:
+      return (False, "")        # Whitelist overrides blacklist
+
+  return (True, reason)
+
+
+def _check_keywords(text, keywords) → (bool, str):
+  text_lower = text.lower()
   for rule in keywords:
     parts = [p.strip() for p in rule.split("+") if p.strip()]
-    # "скидка+купить" → ["скидка", "купить"]
-    # "реклама" → ["реклама"]
-
     if all(part in text_lower for part in parts):
       label = " + ".join(parts) if len(parts) > 1 else parts[0]
       return (True, f"Найдено правило: '{label}'")
-
   return (False, "")
 ```
 
@@ -529,6 +576,10 @@ is_ad(text, keywords, use_ai=False) → (bool, str):
 | `реклама` | single word | any message containing "реклама" (case-insensitive) |
 | `скидка+купить` | AND | message must contain BOTH "скидка" AND "купить" |
 | `промокод+10%` | AND | message must contain "промокод" AND "10%" |
+
+### Whitelist
+
+Each feed has an independent whitelist. If a message was blocked by the blacklist but contains a whitelist rule — it is forwarded. Same `+` syntax as blacklist. Use case: a channel links to its own mirror (`max.ru/spizivyaz`) — add that URL to the whitelist so posts with that link are not blocked by the `max` blacklist rule.
 
 ### Limitations
 
@@ -566,11 +617,13 @@ _show(chat_id, msg_id, text, markup, parse_mode="HTML"):
 | Screen | Trigger | Shows | Buttons |
 |--------|---------|-------|---------|
 | Feed list | `/start`, `/feedlist`, `back:feeds` | All user feeds with channel count; monitoring status | Feed buttons, ➕ Add, ▶️/⏹ Start/Stop, ⚙️ Settings |
-| Feed detail | `feed:{id}` | Name, destination, channel count, filter count, enabled status | 📺 Destination, 📡 Channels, 🔍 Filters, ✅/❌ Toggle, ✏️ Rename, 🗑️ Delete, ◀️ Back |
+| Feed detail | `feed:{id}` | Name, destination, source count, ⬛/⬜ list counts, enabled | 📺 Пересылать в…, 📡 Источники, ⬛ Чёрный список, ⬜ Белый список, ✏️ Название, 🗑 Удалить, ⏹/▶️ Стоп/Старт, ◀️ Назад |
 | Channels | `channels:{id}` | Source channel list | ➕ Add, ➖ Delete, ◀️ Back |
 | Channel delete | `ch_del_list:{id}` | Channel list, each tappable | [channel buttons], ◀️ Back |
-| Filters | `filters:{id}` | Keyword list | ➕ Add, ➖ Delete, ◀️ Back |
-| Filter delete | `kw_del_list:{id}` | Keyword list, each tappable | [keyword buttons], ◀️ Back |
+| ⬛ Чёрный список | `filters:{id}` | Blacklist rules | ➕ Add, ➖ Delete, ◀️ Back |
+| Blacklist delete | `kw_del_list:{id}` | Rule list, each tappable | [rule buttons], ◀️ Back |
+| ⬜ Белый список | `whitelist:{id}` | Whitelist rules | ➕ Add, ➖ Delete, ◀️ Back |
+| Whitelist delete | `wl_del_list:{id}` | Rule list, each tappable | [rule buttons], ◀️ Back |
 | Delete confirm | `delete:{id}` | "Delete feed X?" | ✅ Yes (`delete_ok:{id}`), ❌ No |
 | Settings | `/settings`, `settings` callback | api_id, api_hash (first 6 chars + `****`), auth status | 🔑 Enter api_id, 🔑 Enter api_hash, 📷 QR login, ◀️ Back |
 
@@ -594,6 +647,7 @@ _states: dict[int, {"step": str, "ctx": dict}]
 | `set_dest` | Forwarded message | update_feed(destination=channel_id), reload | "Перешлите сообщение из канала" |
 | `add_channel` | Forwarded message | add_channel(@username or channel_id), reload | "Перешлите сообщение из канала" |
 | `add_keyword` | Non-empty string | add_keyword() | — |
+| `add_whitelist` | Non-empty string | add_whitelist_keyword() | — |
 
 ### Commands
 
@@ -622,6 +676,9 @@ step = add_channel:
 
 step = add_keyword:
   → show_filters(feed_id from ctx)
+
+step = add_whitelist:
+  → show_whitelist(feed_id from ctx)
 
 default:
   → show_feed_list()
@@ -667,8 +724,10 @@ normalize_channel(channel: str) -> str:
    → append each row to feed_map[row.feed_id]["channels"]
 4. SELECT filter_keywords WHERE feed_id IN (?, ?, ...)
    → append each row to feed_map[row.feed_id]["keywords"]
-5. return list(feed_map.values())
-Total: always 3 queries regardless of feed count
+5. SELECT whitelist_keywords WHERE feed_id IN (?, ?, ...)
+   → append each row to feed_map[row.feed_id]["whitelist"]
+6. return list(feed_map.values())
+Total: always 4 queries regardless of feed count
 ```
 
 ### Bot API Long-Poll Loop

@@ -226,7 +226,7 @@
   <div class="subtitle">Technical Specification</div>
   <div class="accent-line"></div>
   <div class="meta">
-    <strong>Version:</strong> 1.1 (May 2026)<br>
+    <strong>Version:</strong> 1.2 (June 2026)<br>
     <strong>Repository:</strong> github.com/JuliaSivridi/PureFeed<br>
     <strong>Bot:</strong> @pure_feed_bot<br>
     <strong>Stack:</strong> Python 3.11 · FastAPI · Telethon · SQLite · Docker
@@ -383,8 +383,7 @@ _forward_message() ◀───────────────────�
     │&nbsp;&nbsp;&nbsp;└── <span class="dim">telegram_*.session&nbsp;&nbsp;&nbsp;# Telethon session file per user</span><br>
     ├── <span class="blue">docs/</span><br>
     │&nbsp;&nbsp;&nbsp;├── <span class="dim">tech-spec.md</span><br>
-    │&nbsp;&nbsp;&nbsp;├── <span class="dim">tech-spec.html</span><br>
-    │&nbsp;&nbsp;&nbsp;└── <span class="dim">tech-spec-example.css</span><br>
+    │&nbsp;&nbsp;&nbsp;└── <span class="dim">tech-spec.html&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# CSS embedded</span><br>
     ├── <span class="dim">Dockerfile</span><br>
     ├── <span class="dim">docker-compose.yml</span><br>
     ├── <span class="dim">requirements.txt</span><br>
@@ -409,6 +408,7 @@ _forward_message() ◀───────────────────�
       <tr><td>created_at</td><td>str</td><td>utcnow()</td><td>ISO 8601 timestamp</td></tr>
       <tr><td>channels</td><td>list[str]</td><td>[]</td><td>Virtual: loaded from <code>source_channels</code> table</td></tr>
       <tr><td>keywords</td><td>list[str]</td><td>[]</td><td>Virtual: loaded from <code>filter_keywords</code> table</td></tr>
+      <tr><td>whitelist</td><td>list[str]</td><td>[]</td><td>Virtual: loaded from <code>whitelist_keywords</code> table</td></tr>
     </tbody>
   </table>
 
@@ -433,6 +433,18 @@ _forward_message() ◀───────────────────�
   </table>
 
   <h2>FilterKeyword</h2>
+  <p>Blacklist rules — message is blocked if any rule matches.</p>
+  <table>
+    <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td>id</td><td>int</td><td>PK autoincrement</td></tr>
+      <tr><td>feed_id</td><td>int</td><td>FK → feeds.id ON DELETE CASCADE</td></tr>
+      <tr><td>keyword</td><td>str</td><td>Stored lowercase; single word or <code>word+word</code> AND-rule</td></tr>
+    </tbody>
+  </table>
+
+  <h2>WhitelistKeyword</h2>
+  <p>Whitelist exception rules. If a message matched the blacklist but also matches a whitelist rule, it is forwarded.</p>
   <table>
     <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
     <tbody>
@@ -488,6 +500,13 @@ CREATE TABLE channel_last_seen (
     updated_at       TEXT NOT NULL
 );
 
+CREATE TABLE whitelist_keywords (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_id INTEGER NOT NULL,
+    keyword TEXT NOT NULL,
+    FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+);
+
 CREATE TABLE user_settings (
     user_id  INTEGER PRIMARY KEY,
     api_id   INTEGER,
@@ -495,7 +514,7 @@ CREATE TABLE user_settings (
 );</code></pre>
 
   <div class="callout"><strong>Migration:</strong> On startup, <code>init_db()</code> attempts <code>ALTER TABLE feeds ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0</code>. The <code>except</code> block silently ignores <code>OperationalError</code> if the column already exists. No formal version tracking.</div>
-  <div class="note"><strong>Bulk read pattern:</strong> <code>get_all_feeds()</code> always uses exactly 3 queries regardless of feed count — feeds, then channels, then keywords — using <code>WHERE feed_id IN (?,?,…)</code>.</div>
+  <div class="note"><strong>Bulk read pattern:</strong> <code>get_all_feeds()</code> always uses exactly 4 queries regardless of feed count — feeds, then channels, then keywords, then whitelist — using <code>WHERE feed_id IN (?,?,…)</code>.</div>
 
   <h2>Channel Format Reference</h2>
   <table>
@@ -711,21 +730,30 @@ await client.delete_messages(relay_entity, relay_ids)</code></pre>
   <p><strong>File:</strong> <code>app/filter.py</code> — class <code>AdFilter</code>, singleton <code>ad_filter</code></p>
 
   <h2>Algorithm</h2>
-  <pre><code>is_ad(text, keywords, use_ai=False) → (bool, str):
+  <pre><code>is_ad(text, keywords, use_ai=False, whitelist=None) → (bool, str):
   if not text or not text.strip():
     return (False, "")          # Empty/media-only messages always pass
 
-  text_lower = text.lower()
+  matched, reason = _check_keywords(text, keywords)
+  if not matched:
+    return (False, "")
 
+  # Blacklist matched — check whitelist override
+  if whitelist:
+    wl_matched, _ = _check_keywords(text, whitelist)
+    if wl_matched:
+      return (False, "")        # Whitelist overrides blacklist
+
+  return (True, reason)
+
+
+def _check_keywords(text, keywords) → (bool, str):
+  text_lower = text.lower()
   for rule in keywords:
     parts = [p.strip() for p in rule.split("+") if p.strip()]
-    # "скидка+купить" → ["скидка", "купить"]
-    # "реклама"       → ["реклама"]
-
     if all(part in text_lower for part in parts):
       label = " + ".join(parts) if len(parts) > 1 else parts[0]
       return (True, f"Найдено правило: '{label}'")
-
   return (False, "")</code></pre>
 
   <h2>Rule Syntax</h2>
@@ -737,6 +765,10 @@ await client.delete_messages(relay_entity, relay_ids)</code></pre>
       <tr><td><code>промокод+10%</code></td><td>AND</td><td>message must contain "промокод" AND "10%"</td></tr>
     </tbody>
   </table>
+
+  <h2>Whitelist</h2>
+  <p>Each feed has an independent whitelist. If a message was blocked by the blacklist but contains a whitelist rule — it is forwarded. Same <code>+</code> syntax as blacklist.</p>
+  <div class="note"><strong>Use case:</strong> channel <code>@petelbka</code> legitimately links to <code>max.ru/spizivyaz</code> in its posts, but <code>max</code> is on the blacklist (MAX messenger spam). Add <code>max.ru/spizivyaz</code> to the whitelist — posts with that exact URL pass through even if they contain "max".</div>
 
   <h2>Limitations</h2>
   <ul>
@@ -770,11 +802,13 @@ await client.delete_messages(relay_entity, relay_ids)</code></pre>
     <thead><tr><th>Screen</th><th>Trigger</th><th>Shows</th><th>Buttons</th></tr></thead>
     <tbody>
       <tr><td>Feed list</td><td><code>/start</code>, <code>/feedlist</code>, <code>back:feeds</code></td><td>All user feeds with channel count; monitoring status</td><td>Feed buttons, ➕ Add, ▶️/⏹ Start/Stop, ⚙️ Settings</td></tr>
-      <tr><td>Feed detail</td><td><code>feed:{id}</code></td><td>Name, destination, channel count, filter count, enabled</td><td>📺 Destination, 📡 Channels, 🔍 Filters, Toggle, ✏️ Rename, 🗑 Delete, ◀️ Back</td></tr>
+      <tr><td>Feed detail</td><td><code>feed:{id}</code></td><td>Name, destination, source/blacklist/whitelist counts, enabled</td><td>📺 Пересылать в…, 📡 Источники, ⬛ Чёрный список, ⬜ Белый список, ✏️ Название, 🗑 Удалить, ⏹/▶️ Стоп/Старт, ◀️ Назад</td></tr>
       <tr><td>Channels</td><td><code>channels:{id}</code></td><td>Source channel list</td><td>➕ Add, ➖ Delete, ◀️ Back</td></tr>
       <tr><td>Channel delete</td><td><code>ch_del_list:{id}</code></td><td>Channel list, each tappable</td><td>[channel buttons], ◀️ Back</td></tr>
-      <tr><td>Filters</td><td><code>filters:{id}</code></td><td>Keyword list in <code>&lt;code&gt;</code> tags</td><td>➕ Add, ➖ Delete, ◀️ Back</td></tr>
-      <tr><td>Filter delete</td><td><code>kw_del_list:{id}</code></td><td>Keyword list, each tappable</td><td>[keyword buttons], ◀️ Back</td></tr>
+      <tr><td>⬛ Чёрный список</td><td><code>filters:{id}</code></td><td>Blacklist rules</td><td>➕ Add, ➖ Delete, ◀️ Back</td></tr>
+      <tr><td>Blacklist delete</td><td><code>kw_del_list:{id}</code></td><td>Rule list, each tappable</td><td>[rule buttons], ◀️ Back</td></tr>
+      <tr><td>⬜ Белый список</td><td><code>whitelist:{id}</code></td><td>Whitelist rules</td><td>➕ Add, ➖ Delete, ◀️ Back</td></tr>
+      <tr><td>Whitelist delete</td><td><code>wl_del_list:{id}</code></td><td>Rule list, each tappable</td><td>[rule buttons], ◀️ Back</td></tr>
       <tr><td>Delete confirm</td><td><code>delete:{id}</code></td><td>"Delete feed X?"</td><td>✅ Yes (<code>delete_ok:{id}</code>), ❌ No</td></tr>
       <tr><td>Settings</td><td><code>/settings</code>, <code>settings</code></td><td>api_id, api_hash (first 6 chars + ****), auth status</td><td>🔑 api_id, 🔑 api_hash, 📷 QR login, ◀️ Back</td></tr>
     </tbody>
@@ -797,6 +831,7 @@ await client.delete_messages(relay_entity, relay_ids)</code></pre>
       <tr><td><code>set_dest</code></td><td>Forwarded message</td><td>update_feed(destination=channel_id), reload</td><td>"Перешлите сообщение из канала"</td></tr>
       <tr><td><code>add_channel</code></td><td>Forwarded message</td><td>add_channel(@username or channel_id), reload</td><td>"Перешлите сообщение из канала"</td></tr>
       <tr><td><code>add_keyword</code></td><td>Non-empty string</td><td>add_keyword()</td><td>—</td></tr>
+      <tr><td><code>add_whitelist</code></td><td>Non-empty string</td><td>add_whitelist_keyword()</td><td>—</td></tr>
     </tbody>
   </table>
 
@@ -827,6 +862,9 @@ step = add_channel:
 
 step = add_keyword:
   → show_filters(feed_id from ctx)
+
+step = add_whitelist:
+  → show_whitelist(feed_id from ctx)
 
 default:
   → show_feed_list()</code></pre>
@@ -865,8 +903,10 @@ default:
    → append each row to feed_map[row.feed_id]["channels"]
 4. SELECT filter_keywords WHERE feed_id IN (?, ?, ...)
    → append each row to feed_map[row.feed_id]["keywords"]
-5. return list(feed_map.values())
-Total: always 3 queries regardless of feed count</code></pre>
+5. SELECT whitelist_keywords WHERE feed_id IN (?, ?, ...)
+   → append each row to feed_map[row.feed_id]["whitelist"]
+6. return list(feed_map.values())
+Total: always 4 queries regardless of feed count</code></pre>
 
   <h2>Bot API Long-Poll Loop</h2>
   <pre><code>offset = 0
