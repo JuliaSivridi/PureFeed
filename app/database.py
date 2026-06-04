@@ -33,6 +33,13 @@ async def init_db():
         except Exception:
             pass  # Колонка уже существует
 
+        # Миграция: добавляем is_silent если колонки ещё нет
+        try:
+            await db.execute("ALTER TABLE feeds ADD COLUMN is_silent INTEGER NOT NULL DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass  # Колонка уже существует
+
         # Таблица исходных каналов для каждого фида
         await db.execute("""
             CREATE TABLE IF NOT EXISTS source_channels (
@@ -94,6 +101,7 @@ def _feed_row_to_dict(row) -> dict:
         "enabled": bool(row[4]),
         "user_id": row[5],
         "created_at": row[6],
+        "is_silent": bool(row[7]) if len(row) > 7 else False,
         "channels": [],
         "keywords": [],
         "whitelist": [],
@@ -109,12 +117,12 @@ async def get_all_feeds(user_id: int | None = None) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         if user_id is not None:
             cursor = await db.execute(
-                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at FROM feeds WHERE user_id = ? ORDER BY created_at DESC",
+                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at, is_silent FROM feeds WHERE user_id = ? ORDER BY created_at DESC",
                 (user_id,),
             )
         else:
             cursor = await db.execute(
-                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at FROM feeds ORDER BY created_at DESC"
+                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at, is_silent FROM feeds ORDER BY created_at DESC"
             )
         rows = await cursor.fetchall()
         feeds = [_feed_row_to_dict(row) for row in rows]
@@ -158,12 +166,12 @@ async def get_feed(feed_id: int, user_id: int | None = None) -> Optional[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         if user_id is not None:
             cursor = await db.execute(
-                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at FROM feeds WHERE id = ? AND user_id = ?",
+                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at, is_silent FROM feeds WHERE id = ? AND user_id = ?",
                 (feed_id, user_id),
             )
         else:
             cursor = await db.execute(
-                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at FROM feeds WHERE id = ?",
+                "SELECT id, name, destination_channel, use_ai_filter, enabled, user_id, created_at, is_silent FROM feeds WHERE id = ?",
                 (feed_id,),
             )
         row = await cursor.fetchone()
@@ -196,18 +204,40 @@ async def get_feed(feed_id: int, user_id: int | None = None) -> Optional[dict]:
         return feed
 
 
-async def create_feed(name: str, destination_channel: str, user_id: int = 0, use_ai_filter: bool = False) -> dict:
+async def create_feed(
+    name: str,
+    destination_channel: str,
+    user_id: int = 0,
+    use_ai_filter: bool = False,
+    is_silent: bool = False,
+) -> dict:
     """Создаёт новый фид и возвращает его."""
     created_at = datetime.utcnow().isoformat()
+    dest = normalize_channel(destination_channel) if destination_channel else ""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO feeds (name, destination_channel, use_ai_filter, enabled, user_id, created_at) VALUES (?, ?, ?, 1, ?, ?)",
-            (name, normalize_channel(destination_channel), int(use_ai_filter), user_id, created_at),
+            "INSERT INTO feeds (name, destination_channel, use_ai_filter, enabled, user_id, created_at, is_silent) VALUES (?, ?, ?, 1, ?, ?, ?)",
+            (name, dest, int(use_ai_filter), user_id, created_at, int(is_silent)),
         )
         await db.commit()
         feed_id = cursor.lastrowid
 
     return await get_feed(feed_id)
+
+
+async def get_or_create_silent_feed(user_id: int) -> dict:
+    """Возвращает встроенный тихий фид пользователя, создаёт если не существует."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM feeds WHERE user_id = ? AND is_silent = 1",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+
+    if row:
+        return await get_feed(row[0])
+
+    return await create_feed("🔇 Тихое чтение", "", user_id=user_id, is_silent=True)
 
 
 async def update_feed(feed_id: int, **kwargs) -> Optional[dict]:

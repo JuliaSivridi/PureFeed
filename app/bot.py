@@ -385,9 +385,8 @@ class TelegramBot:
                 return
 
             self._events_matched += 1
-            logger.info(f"Сообщение из {chat_username or chat.id} (id={chat.id}) → {len(feeds_for_channel)} фид(ов)")
 
-            # Помечаем прочитанным в исходном канале
+            # Помечаем прочитанным в исходном канале (для всех фидов, включая тихие)
             try:
                 await self.client.send_read_acknowledge(chat, message)
             except Exception:
@@ -395,13 +394,25 @@ class TelegramBot:
 
             source_name = chat_username or getattr(chat, 'title', str(chat.id))
 
+            # Разделяем на тихие (только чтение) и обычные (пересылка)
+            silent_feeds = [f for f in feeds_for_channel if f.get("is_silent")]
+            normal_feeds = [f for f in feeds_for_channel if not f.get("is_silent")]
+
+            if silent_feeds:
+                logger.info(f"[Тихое чтение] прочитано из {source_name}")
+
+            if not normal_feeds:
+                return
+
+            logger.info(f"Сообщение из {chat_username or chat.id} (id={chat.id}) → {len(normal_feeds)} фид(ов)")
+
             # Медиагруппа (альбом с несколькими фото) — буферизуем
             if message.grouped_id:
-                await self._buffer_media_group(message, source_name, feeds_for_channel)
+                await self._buffer_media_group(message, source_name, normal_feeds)
                 return
 
             # Одиночное сообщение
-            await self._process_single(message, source_name, feeds_for_channel)
+            await self._process_single(message, source_name, normal_feeds)
 
         except Exception as e:
             logger.error(f"Критическая ошибка в обработчике: {e}")
@@ -548,6 +559,7 @@ class TelegramBot:
                     text=text,
                     keywords=feed.get("keywords", []),
                     use_ai=feed.get("use_ai_filter", False),
+                    whitelist=feed.get("whitelist", []),
                 )
 
                 if is_ad:

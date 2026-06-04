@@ -16,6 +16,7 @@ from app.database import (
     get_feed, get_all_feeds, create_feed, delete_feed, update_feed,
     add_channel, remove_channel, add_keyword, remove_keyword,
     add_whitelist_keyword, remove_whitelist_keyword,
+    get_or_create_silent_feed,
     get_user_settings, save_user_settings,
 )
 
@@ -134,24 +135,37 @@ async def _answer(callback_id: str, text: str = ""):
 # ─── Screens ──────────────────────────────────────────────────────────────────
 
 async def show_feed_list(chat_id: int, msg_id: int | None, sm: "SessionManager"):
+    # Автоматически создаём тихий фид если ещё нет
+    await get_or_create_silent_feed(chat_id)
+
     bot = sm.get(chat_id)
     monitoring = bot.is_monitoring if bot else False
     status_line = "🟢 Сервис работает" if monitoring else "🔴 Сервис остановлен"
 
     feeds = await get_all_feeds(user_id=chat_id)
     seen: set[int] = set()
-    unique: list[dict] = []
+    normal_feeds: list[dict] = []
+    silent_feed: dict | None = None
     for f in feeds:
         if f["id"] not in seen:
             seen.add(f["id"])
-            unique.append(f)
+            if f.get("is_silent"):
+                silent_feed = f
+            else:
+                normal_feeds.append(f)
 
-    total_channels = sum(len(f["channels"]) for f in unique)
-    text = f"{status_line}\n\n📋 <b>Фиды</b> — {total_channels}" + ("" if unique else "\n\nНет фидов. Создайте первый!")
+    total_channels = sum(len(f["channels"]) for f in normal_feeds)
+    text = f"{status_line}\n\n📋 <b>Фиды</b> — {total_channels}" + ("" if normal_feeds else "\n\nНет фидов. Создайте первый!")
+
     buttons = [
         [{"text": f"{'✅' if f['enabled'] else '❌'} {f['name']} — {len(f['channels'])}", "callback_data": f"feed:{f['id']}"}]
-        for f in unique
+        for f in normal_feeds
     ]
+
+    if silent_feed:
+        sf_icon = "✅" if silent_feed["enabled"] else "❌"
+        buttons.append([{"text": f"{sf_icon} 🔇 Тихое чтение — {len(silent_feed['channels'])}", "callback_data": f"feed:{silent_feed['id']}"}])
+
     buttons.append([{"text": "➕ Добавить фид", "callback_data": "feed:new"}])
     if monitoring:
         buttons.append([{"text": "⏹ Стоп сервис", "callback_data": "monitor:stop"}])
@@ -195,27 +209,43 @@ async def show_feed(chat_id: int, feed_id: int, msg_id: int | None):
         await _send(chat_id, "❌ Фид не найден.")
         return
     enabled = feed["enabled"]
-    dest = feed["destination_channel"] or "не задан"
-    text = (
-        f"📌 <b>{feed['name']}</b>\n\n"
-        f"📺 Пересылка в: <code>{dest}</code>\n"
-        f"📡 Источники: {len(feed['channels'])}\n"
-        f"⬛ Чёрный список: {len(feed['keywords'])}\n"
-        f"⬜ Белый список: {len(feed.get('whitelist', []))}\n"
-        f"Статус: {'✅ активен' if enabled else '❌ выключен'}"
-    )
-    markup = {"inline_keyboard": [
-        [{"text": "📺 Пересылать в ...",  "callback_data": f"setdest:{feed_id}"}],
-        [{"text": "📡 Источники",          "callback_data": f"channels:{feed_id}"}],
-        [{"text": "⬛ Чёрный список",      "callback_data": f"filters:{feed_id}"}],
-        [{"text": "⬜ Белый список",        "callback_data": f"whitelist:{feed_id}"}],
-        [
-            {"text": "✏️ Название", "callback_data": f"rename:{feed_id}"},
-            {"text": "🗑 Удалить",   "callback_data": f"delete:{feed_id}"},
-        ],
-        [{"text": "⏹ Стоп" if enabled else "▶️ Старт", "callback_data": f"toggle:{feed_id}"}],
-        [{"text": "◀️ Назад", "callback_data": "back:feeds"}],
-    ]}
+
+    if feed.get("is_silent"):
+        text = (
+            f"🔇 <b>Тихое чтение</b>\n\n"
+            f"Сообщения из этих каналов автоматически помечаются прочитанными — "
+            f"счётчик гасится, пересылки нет, фильтры не применяются.\n\n"
+            f"📡 Источники: {len(feed['channels'])}\n"
+            f"Статус: {'✅ активен' if enabled else '❌ выключен'}"
+        )
+        markup = {"inline_keyboard": [
+            [{"text": "📡 Источники", "callback_data": f"channels:{feed_id}"}],
+            [{"text": "⏹ Стоп" if enabled else "▶️ Старт", "callback_data": f"toggle:{feed_id}"}],
+            [{"text": "◀️ Назад", "callback_data": "back:feeds"}],
+        ]}
+    else:
+        dest = feed["destination_channel"] or "не задан"
+        text = (
+            f"📌 <b>{feed['name']}</b>\n\n"
+            f"📺 Пересылка в: <code>{dest}</code>\n"
+            f"📡 Источники: {len(feed['channels'])}\n"
+            f"⬛ Чёрный список: {len(feed['keywords'])}\n"
+            f"⬜ Белый список: {len(feed.get('whitelist', []))}\n"
+            f"Статус: {'✅ активен' if enabled else '❌ выключен'}"
+        )
+        markup = {"inline_keyboard": [
+            [{"text": "📺 Пересылать в ...",  "callback_data": f"setdest:{feed_id}"}],
+            [{"text": "📡 Источники",          "callback_data": f"channels:{feed_id}"}],
+            [{"text": "⬛ Чёрный список",      "callback_data": f"filters:{feed_id}"}],
+            [{"text": "⬜ Белый список",        "callback_data": f"whitelist:{feed_id}"}],
+            [
+                {"text": "✏️ Название", "callback_data": f"rename:{feed_id}"},
+                {"text": "🗑 Удалить",   "callback_data": f"delete:{feed_id}"},
+            ],
+            [{"text": "⏹ Стоп" if enabled else "▶️ Старт", "callback_data": f"toggle:{feed_id}"}],
+            [{"text": "◀️ Назад", "callback_data": "back:feeds"}],
+        ]}
+
     await _show(chat_id, msg_id, text, markup)
 
 
@@ -692,6 +722,10 @@ async def handle_callback(callback: dict, sm: "SessionManager"):
     elif data.startswith("delete_ok:"):
         feed_id = int(data.split(":")[1])
         feed = await get_feed(feed_id, user_id=chat_id)
+        if feed and feed.get("is_silent"):
+            await _send(chat_id, "ℹ️ Тихое чтение — встроенная функция, удалить нельзя.")
+            await show_feed(chat_id, feed_id, msg_id)
+            return
         name = feed["name"] if feed else str(feed_id)
         await delete_feed(feed_id)
         bot = sm.get(chat_id)
