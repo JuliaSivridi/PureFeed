@@ -516,6 +516,9 @@ async def handle_message(chat_id: int, message: dict, sm: "SessionManager"):
             await _send(chat_id, f"❌ Ошибка авторизации: {e}")
 
     elif step == "auth_2fa":
+        # Стираем сообщение с паролем 2FA из истории чата сразу же
+        if message.get("message_id"):
+            await _delete(chat_id, message["message_id"])
         bot = sm.get(chat_id)
         if not bot:
             _clear_state(chat_id)
@@ -536,6 +539,9 @@ async def handle_message(chat_id: int, message: dict, sm: "SessionManager"):
             await _send(chat_id, f"❌ Ошибка: {e}")
 
     elif step == "auth_2fa_qr":
+        # Стираем сообщение с паролем 2FA из истории чата сразу же
+        if message.get("message_id"):
+            await _delete(chat_id, message["message_id"])
         bot = sm.get(chat_id)
         if not bot:
             _clear_state(chat_id)
