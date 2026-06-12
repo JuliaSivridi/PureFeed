@@ -1,6 +1,6 @@
 # PureFeed — Technical Specification
 
-**Version:** 1.2 (June 2026)  
+**Version:** 1.3 (June 2026)  
 **Repository:** github.com/JuliaSivridi/PureFeed  
 **Bot:** @pure_feed_bot  
 **Stack:** Python 3.11 · FastAPI · Telethon · SQLite · Docker
@@ -85,26 +85,32 @@ TelegramClient (Telethon, per-user)
         ▼
 _process_message()
         │ match chat.id → id_to_feeds
-        │ mark source as read
-        ▼
-    [media group?]──yes──▶ buffer 1.0s ──▶ _forward_media_group()
-        │no                                      │
-        ▼                                        │
-_process_single()                                │
-        │ ad_filter.is_ad()                      │
-        │ skip if ad                             │
-        ▼                                        ▼
-_forward_message() ◀──────────────────────────────
+        │ send_read_acknowledge(chat, message)   ← always, for all feed types
         │
-        ├─── relay path (preferred) ─────────────────────────────────────────┐
-        │    Telethon forward_messages(relay_channel, msg, silent=True)       │
-        │    → Bot API forwardMessage(from=relay, to=destination)             │
-        │    → Telethon delete_messages(relay_channel, [relay_id])            │
-        │    Result: unread counter ✅                                         │
-        │                                                                     │
-        └─── direct path (fallback if relay fails) ───────────────────────────
-             Telethon forward_messages(destination, msg)
-             Result: no unread counter ❌
+        ├─── silent feeds ──────────────────────────────────────────────────▶ done
+        │    (is_silent=True: counter cleared, no forwarding, no filtering)
+        │
+        └─── normal feeds ──────────────────────────────────────────────────▶
+                │
+                ▼
+        [media group?]──yes──▶ buffer 1.0s ──▶ _forward_media_group()
+                │no                                      │
+                ▼                                        │
+        _process_single()                                │
+                │ ad_filter.is_ad()                      │
+                │ skip if ad                             │
+                ▼                                        ▼
+        _forward_message() ◀──────────────────────────────
+                │
+                ├─── relay path (preferred) ─────────────────────────────────┐
+                │    Telethon forward_messages(relay_channel, msg, silent=True)│
+                │    → Bot API forwardMessage(from=relay, to=destination)      │
+                │    → Telethon delete_messages(relay_channel, [relay_id])     │
+                │    Result: unread counter ✅                                  │
+                │                                                              │
+                └─── direct path (fallback if relay fails) ────────────────────
+                     Telethon forward_messages(destination, msg)
+                     Result: no unread counter ❌
 ```
 
 ### Write Path (user action)
@@ -158,8 +164,7 @@ Pure_Feed/
 │   ├── feeds.db             # SQLite database (all user data)
 │   └── telegram_*.session   # Telethon session file per user
 ├── docs/
-│   ├── tech-spec.md         # This file
-│   └── tech-spec.html       # HTML version (CSS embedded)
+│   └── tech-spec.md         # This file
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -185,6 +190,7 @@ Represents one user's filtering configuration: a set of source channels → one 
 | enabled | bool | True | Paused feeds still stored but skipped in handler |
 | user_id | int | 0 | Telegram user ID of owner; isolates feeds per user |
 | created_at | str | utcnow() | ISO 8601 timestamp |
+| is_silent | bool | False | Silent read mode: mark source channels as read, no forwarding, no filtering |
 | channels | list[str] | [] | Virtual: loaded from `source_channels` table |
 | keywords | list[str] | [] | Virtual: loaded from `filter_keywords` table |
 | whitelist | list[str] | [] | Virtual: loaded from `whitelist_keywords` table |
@@ -251,7 +257,8 @@ CREATE TABLE feeds (
     use_ai_filter       INTEGER NOT NULL DEFAULT 0,
     enabled             INTEGER NOT NULL DEFAULT 1,
     user_id             INTEGER NOT NULL DEFAULT 0,
-    created_at          TEXT NOT NULL
+    created_at          TEXT NOT NULL,
+    is_silent           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE source_channels (
@@ -288,7 +295,11 @@ CREATE TABLE user_settings (
 );
 ```
 
-**Migration:** On startup, `init_db()` attempts `ALTER TABLE feeds ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`. The `except` block silently ignores `OperationalError` if column exists. No formal version tracking.
+**Migrations:** On startup, `init_db()` runs two `ALTER TABLE` migrations wrapped in `try/except` (silently ignored if the column already exists):
+- `ALTER TABLE feeds ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0`
+- `ALTER TABLE feeds ADD COLUMN is_silent INTEGER NOT NULL DEFAULT 0`
+
+No formal version tracking.
 
 **Bulk read pattern:** `get_all_feeds()` fetches feeds, then channels, then keywords, then whitelist in **four queries** (not N+1) using `WHERE feed_id IN (?,?,...)`.
 
@@ -409,15 +420,25 @@ async def _process_message(event, channel_to_feeds, id_to_feeds):
         else:
             logger.debug("Не в фидах: ..."); return
 
-    # Mark source as read (best-effort, silent failure)
+    # Mark source as read (best-effort, silent failure) — applies to all feed types
     try: await client.send_read_acknowledge(chat, message)
     except: pass
 
-    # Route by message type
+    # Separate silent feeds (read-only) from normal feeds (forward)
+    silent_feeds = [f for f in feeds_for_channel if f.get("is_silent")]
+    normal_feeds = [f for f in feeds_for_channel if not f.get("is_silent")]
+
+    if silent_feeds:
+        logger.info(f"[Тихое чтение] прочитано из {source_name}")
+
+    if not normal_feeds:
+        return  # nothing to forward
+
+    # Route normal feeds by message type
     if message.grouped_id:
-        await _buffer_media_group(message, source_name, feeds_for_channel)
+        await _buffer_media_group(message, source_name, normal_feeds)
     else:
-        await _process_single(message, source_name, feeds_for_channel)
+        await _process_single(message, source_name, normal_feeds)
 ```
 
 ### Keepalive Loop
@@ -616,8 +637,9 @@ _show(chat_id, msg_id, text, markup, parse_mode="HTML"):
 
 | Screen | Trigger | Shows | Buttons |
 |--------|---------|-------|---------|
-| Feed list | `/start`, `/feedlist`, `back:feeds` | All user feeds with channel count; monitoring status | Feed buttons, ➕ Add, ▶️/⏹ Start/Stop, ⚙️ Settings |
-| Feed detail | `feed:{id}` | Name, destination, source count, ⬛/⬜ list counts, enabled | 📺 Пересылать в…, 📡 Источники, ⬛ Чёрный список, ⬜ Белый список, ✏️ Название, 🗑 Удалить, ⏹/▶️ Стоп/Старт, ◀️ Назад |
+| Feed list | `/start`, `/feedlist`, `back:feeds` | Normal feeds + 🔇 Тихое чтение; monitoring status | Feed buttons, 🔇 Тихое чтение, ➕ Add, ▶️/⏹ Start/Stop, ⚙️ Settings |
+| Feed detail | `feed:{id}` (normal) | Name, destination, source count, ⬛/⬜ list counts, enabled | 📺 Пересылать в…, 📡 Источники, ⬛ Чёрный список, ⬜ Белый список, ✏️ Название, 🗑 Удалить, ⏹/▶️ Стоп/Старт, ◀️ Назад |
+| 🔇 Тихое чтение | `feed:{id}` (is_silent=True) | Source count, enabled status. No dest/filters. | 📡 Источники, ⏹/▶️ Стоп/Старт, ◀️ Назад |
 | Channels | `channels:{id}` | Source channel list | ➕ Add, ➖ Delete, ◀️ Back |
 | Channel delete | `ch_del_list:{id}` | Channel list, each tappable | [channel buttons], ◀️ Back |
 | ⬛ Чёрный список | `filters:{id}` | Blacklist rules | ➕ Add, ➖ Delete, ◀️ Back |
@@ -714,6 +736,20 @@ normalize_channel(channel: str) -> str:
 
   return ch
 ```
+
+### Silent Feed Auto-Creation
+
+```
+get_or_create_silent_feed(user_id) → feed_dict:
+  SELECT id FROM feeds WHERE user_id = ? AND is_silent = 1
+  if found:
+    return get_feed(row.id)
+  else:
+    return create_feed("🔇 Тихое чтение", "", user_id=user_id, is_silent=True)
+```
+
+Called on every `show_feed_list()` — idempotent, creates exactly one silent feed per user.  
+Protected from deletion: `delete_ok:{id}` callback checks `feed["is_silent"]` and refuses.
 
 ### get_all_feeds Bulk Load (no N+1)
 
@@ -822,6 +858,7 @@ else:
 | INFO | Relay готов: канал {id} «{name}» | Relay init success |
 | INFO | Мониторинг запущен (user={id}) | start_monitoring complete |
 | INFO | Мониторинг остановлен | stop_monitoring called |
+| INFO | [Тихое чтение] прочитано из {src} | Silent feed: message marked read |
 | INFO | [{feed}] Реклама из {src}: {reason} | Message filtered |
 | INFO | [{feed}] Переслано из {src} | Message forwarded |
 | INFO | [{feed}] Переслан альбом (N шт.) | Album forwarded |
